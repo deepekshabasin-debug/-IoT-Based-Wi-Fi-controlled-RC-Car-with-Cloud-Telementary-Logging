@@ -1,0 +1,153 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ThingSpeak.h>
+
+// --- PIN DEFINITIONS ---
+#define MOTOR_L_Fwd 12  
+#define MOTOR_L_Rev 13  
+#define MOTOR_R_Fwd 14  
+#define MOTOR_R_Rev 27  
+#define BATTERY_PIN 34  // Analog pin connected to your voltage divider
+
+// --- NETWORK CONFIGURATION ---
+const char* ssid = "Wifi-Name"; // --- Note: Connect both your laptops thingspeak and car to the same wifi ---
+const char* password = "password";
+
+// --- THINGSPEAK CONFIGURATION ---
+unsigned long myChannelNumber = 3422521;             // Replace with your real ThingSpeak Channel ID
+const char * myWriteAPIKey = "0PLESQ0I0CXNY1SX";   // Replace with your real Write API Key
+
+WiFiClient client;
+WebServer server(80);
+
+// Global telemetry variables
+int currentStatusNum = 0; 
+unsigned long lastCloudUpdateTime = 0;
+const unsigned long cloudInterval = 15000; // ThingSpeak free limit is 15 seconds
+
+const char HTML_PAGE[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>IoT ESP32 Telemetry Car</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background: #1e1e24; color: white; margin: 0; padding: 20px; user-select: none; }
+    h1 { color: #4eedb4; font-size: 28px; margin-bottom: 30px; }
+    .btn { width: 90px; height: 90px; margin: 10px; font-size: 32px; background: #2a2a35; color: #4eedb4; border: 2px solid #4eedb4; border-radius: 20px; touch-action: manipulation; }
+    .btn:active { background: #4eedb4; color: #1e1e24; }
+    .row { display: flex; justify-content: center; align-items: center; }
+    .stop-btn { border-color: #ff5c5c; color: #ff5c5c; }
+    .stop-btn:active { background: #ff5c5c; color: white; }
+  </style>
+</head>
+<body>
+  <h1>IoT ESP32 CAR MONITOR</h1>
+  <div class="row"><button class="btn" ontouchstart="sendCmd('F')" ontouchend="sendCmd('S')">▲</button></div>
+  <div class="row">
+    <button class="btn" ontouchstart="sendCmd('L')" ontouchend="sendCmd('S')">◀</button>
+    <button class="btn stop-btn" onclick="sendCmd('S')">■</button>
+    <button class="btn" ontouchstart="sendCmd('R')" ontouchend="sendCmd('S')">▶</button>
+  </div>
+  <div class="row"><button class="btn" ontouchstart="sendCmd('B')" ontouchend="sendCmd('S')">▼</button></div>
+
+  <script>
+    function sendCmd(direction) {
+      fetch('/action?dir=' + direction);
+    }
+  </script>
+</body>
+</html>
+)=====";
+
+float getBatteryVoltage() {
+  int rawADC = analogRead(BATTERY_PIN);
+  // Convert ADC value (0-4095) to voltage (0-3.3V) at the pin
+  float pinVoltage = (rawADC / 4095.0) * 3.3;
+  // Multiply by 2 because our hardware voltage divider cut it in half
+  float actualBatteryVoltage = pinVoltage * 2.0; 
+  return actualBatteryVoltage;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", HTML_PAGE);
+}
+
+void handleAction() {
+  if (server.hasArg("dir")) {
+    char command = server.arg("dir")[0];
+    
+    if (command == 'F') { 
+      digitalWrite(MOTOR_L_Fwd, HIGH); digitalWrite(MOTOR_L_Rev, LOW);
+      digitalWrite(MOTOR_R_Fwd, HIGH); digitalWrite(MOTOR_R_Rev, LOW);
+      currentStatusNum = 1;
+    } else if (command == 'B') { 
+      digitalWrite(MOTOR_L_Fwd, LOW);  digitalWrite(MOTOR_L_Rev, HIGH);
+      digitalWrite(MOTOR_R_Fwd, LOW);  digitalWrite(MOTOR_R_Rev, HIGH);
+      currentStatusNum = 2;
+    } else if (command == 'L') { 
+      digitalWrite(MOTOR_L_Fwd, LOW);  digitalWrite(MOTOR_L_Rev, HIGH);
+      digitalWrite(MOTOR_R_Fwd, HIGH); digitalWrite(MOTOR_R_Rev, LOW);
+      currentStatusNum = 3;
+    } else if (command == 'R') { 
+      digitalWrite(MOTOR_L_Fwd, HIGH); digitalWrite(MOTOR_L_Rev, LOW);
+      digitalWrite(MOTOR_R_Fwd, LOW);  digitalWrite(MOTOR_R_Rev, HIGH);
+      currentStatusNum = 4;
+    } else { 
+      digitalWrite(MOTOR_L_Fwd, LOW);  digitalWrite(MOTOR_L_Rev, LOW);
+      digitalWrite(MOTOR_R_Fwd, LOW);  digitalWrite(MOTOR_R_Rev, LOW);
+      currentStatusNum = 0;
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(MOTOR_L_Fwd, OUTPUT); pinMode(MOTOR_L_Rev, OUTPUT);
+  pinMode(MOTOR_R_Fwd, OUTPUT); pinMode(MOTOR_R_Rev, OUTPUT);
+  pinMode(BATTERY_PIN, INPUT);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Network!");
+  Serial.print("Local IP Address to open web remote: ");
+  Serial.println(WiFi.localIP());
+
+  ThingSpeak.begin(client); 
+  
+  server.on("/", handleRoot);
+  server.on("/action", handleAction);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Non-blocking loop timer to update ThingSpeak every 15 seconds
+  if (millis() - lastCloudUpdateTime >= cloudInterval) {
+    float batteryVolts = getBatteryVoltage();
+    long rssi = WiFi.RSSI();
+
+    // Stage the data into fields
+    ThingSpeak.setField(1, currentStatusNum);
+    ThingSpeak.setField(2, batteryVolts);
+    ThingSpeak.setField(3, (int)rssi);
+    
+    // Push data to cloud channel
+    int responseCode = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+    
+    if(responseCode == 200){
+      Serial.println("Cloud update successful!");
+    } else {
+      Serial.println("Error updating cloud. Code: " + String(responseCode));
+    }
+
+    lastCloudUpdateTime = millis();
+  }
+}
